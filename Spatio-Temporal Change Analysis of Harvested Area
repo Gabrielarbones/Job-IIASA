@@ -1,0 +1,92 @@
+import numpy as np
+import pandas as pd
+from netCDF4 import Dataset
+import os
+
+
+def ReadNC(file, var='harv_area'):
+    """Read a NETCDF4 raster"""
+    try:
+        data = Dataset(file, "r", format="NETCDF4")
+        return np.ma.filled(data.variables[var][:], 0)  # Replace masked values with 0
+    except Exception as e:
+        print(f"Error reading file {file}: {e}")
+        return None
+
+
+def CreateRaster(data, ras_path, val_name, val_unit, title):
+    """Create a NetCDF file with difference data"""
+    incrm = round(0.5 / 6, 6)
+    ras_lims = [2160, 4320]
+    ras_lats = np.arange(90 - incrm / 2, -ras_lims[0] / 24, -incrm)
+    ras_lons = np.arange(-180 + incrm / 2, ras_lims[1] / 24, incrm)
+
+    # Create a dataset
+    raster = Dataset(ras_path, 'w', format='NETCDF4')
+    raster.title = title
+    raster.institution = 'University of Twente, Netherlands'
+    raster.contact = 'Mialyk Oleksandr (o.mialyk@utwente.nl)'
+
+    # Dimensions
+    raster.createDimension('lat', ras_lims[0])
+    raster.createDimension('lon', ras_lims[1])
+
+    # Variables
+    lon = raster.createVariable('lon', 'f8', 'lon')
+    lat = raster.createVariable('lat', 'f8', 'lat')
+    val = raster.createVariable(val_name, 'f4', ('lat', 'lon',), zlib=True, complevel=6, fill_value=1.e20)
+
+    # Adding values
+    lat[:] = ras_lats
+    lat.long_name = 'latitude'
+    lat.units = 'degrees_north'
+    lon[:] = ras_lons
+    lon.long_name = 'longitude'
+    lon.units = 'degrees_east'
+    val[:, :] = data
+    val.units = val_unit
+    raster.close()
+    print(f"Difference file saved to: {ras_path}")
+
+
+# Define paths
+acea_data_folder = r"C:\"
+outputs_folder = os.path.join(acea_data_folder, "Maps")
+merged_file = os.path.join(outputs_folder, "Merged_all_crops_irrigated_area_annual_2001_2019.nc")
+
+# Load the merged NetCDF file
+data = ReadNC(merged_file, "harv_area")
+
+# Check if data was loaded correctly
+if data is None:
+    print("Failed to load merged data. Please check the file path and format.")
+    exit()
+
+# Calculate averages for recent (2017-2019) and early (2001-2003) years
+recent_avg = np.mean(data[-3:, :, :], axis=0)  # Last three years (2017, 2018, 2019)
+early_avg = np.mean(data[:3, :, :], axis=0)    # First three years (2001, 2002, 2003)
+
+# Calculate the difference (Recent Average - Early Average)
+difference = recent_avg - early_avg
+
+# Path to save the difference NetCDF file
+difference_output_path = os.path.join(outputs_folder, "Difference_Harv_Area_Recent_vs_Early.nc")
+
+# Create and save the difference raster
+CreateRaster(difference, difference_output_path, "harv_area_difference", 'm2 yr-1', 'Difference in Harvested Area (2017-2019 vs. 2001-2003)')
+
+# Calculate the overall difference
+overall_difference = np.sum(difference)
+
+# Convert the difference data to a DataFrame for Excel export
+difference_df = pd.DataFrame(difference)
+
+# Add the overall difference as a separate row
+difference_df.loc['Overall Difference'] = overall_difference
+
+# Path to save the Excel file
+difference_excel_path = os.path.join(outputs_folder, "Difference_Harv_Area_Recent_vs_Early.xlsx")
+
+# Save the difference to Excel
+difference_df.to_excel(difference_excel_path, index=False)
+print(f"Difference values saved to Excel: {difference_excel_path}")
