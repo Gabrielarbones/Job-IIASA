@@ -8,15 +8,15 @@ from pathlib import Path
 # 1) File paths
 # ---------------------------------------------------------
 pistachio_shp = Path(
-    r"C:\Users\Usuario\ownCloud\UPM\Analisis Doctorado\3er artículo\Bases de datos\Crop map\i15_crop_mapping_2022_shp\pistachio_polygons_CA_2022.shp"
+    r"C:.shp"
 )
 soil_tif = Path(
-    r"C:\Users\Usuario\ownCloud\UPM\Analisis Doctorado\3er artículo\Article\Soil health\Soilgrids\Soil organic carbon_CA_0_5.tif"
+    r"C:.tif"
 )
 
 # Output folder for results
 output_folder = Path(
-    r"C:\Users\Usuario\ownCloud\UPM\Analisis Doctorado\3er artículo\Article\Soil health\Docs"
+    r"C:"
 )
 output_folder.mkdir(parents=True, exist_ok=True)
 
