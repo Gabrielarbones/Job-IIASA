@@ -1,0 +1,79 @@
+import geopandas as gpd
+import rioxarray
+import pandas as pd
+from shapely.geometry import mapping
+from pathlib import Path
+
+# ---------------------------------------------------------
+# 1) File paths
+# ---------------------------------------------------------
+pistachio_shp = Path(
+    r"C:\Users\Usuario\ownCloud\UPM\Analisis Doctorado\3er artículo\Bases de datos\Crop map\i15_crop_mapping_2022_shp\pistachio_polygons_CA_2022.shp"
+)
+soil_tif = Path(
+    r"C:\Users\Usuario\ownCloud\UPM\Analisis Doctorado\3er artículo\Article\Soil health\Soilgrids\Soil organic carbon_CA_0_5.tif"
+)
+
+# Output folder for results
+output_folder = Path(
+    r"C:\Users\Usuario\ownCloud\UPM\Analisis Doctorado\3er artículo\Article\Soil health\Docs"
+)
+output_folder.mkdir(parents=True, exist_ok=True)
+
+output_excel = output_folder / "Soil organic carbon_CA_0_5.xlsx"
+output_shp = output_folder / "Soil organic carbon_CA_0_5.shp"
+
+# ---------------------------------------------------------
+# 2) Load polygons and raster lazily
+# ---------------------------------------------------------
+print("Loading pistachio polygons...")
+gdf = gpd.read_file(pistachio_shp)
+print(f"Total polygons: {len(gdf)}")
+
+print("Opening SoilGrids raster (lazy)...")
+rds = rioxarray.open_rasterio(soil_tif, masked=True, chunks=True)
+
+# Match CRS if different
+if gdf.crs != rds.rio.crs:
+    print("Reprojecting polygons to match raster CRS...")
+    gdf = gdf.to_crs(rds.rio.crs)
+
+# ---------------------------------------------------------
+# 3) Compute mean CEC per polygon (streamed window-by-window)
+# ---------------------------------------------------------
+cec_means = []
+for idx, row in gdf.iterrows():
+    geom = [mapping(row.geometry)]
+    try:
+        subset = rds.rio.clip(geom, rds.rio.crs, drop=True)
+        mean_val = float(subset.mean().values)
+    except Exception:
+        mean_val = None
+    cec_means.append(mean_val)
+
+    if (idx + 1) % 100 == 0:
+        print(f"Processed {idx + 1}/{len(gdf)} polygons...")
+
+# ---------------------------------------------------------
+# 4) Keep only selected columns and add mean values
+# ---------------------------------------------------------
+keep_cols = [
+    "UniqueID", "CLASS2", "SUBCLASS2", "YR_PLANTED", "REGION",
+    "ACRES", "COUNTY", "HYDRO_RGN", "LIQ_REPORT",
+    "MAIN_CROP", "MAIN_CROP_", "Shape_Leng", "Shape_Area"
+]
+
+gdf["Soil organic carbon_CA_0_5"] = cec_means
+existing_cols = [c for c in keep_cols if c in gdf.columns]
+gdf = gdf[existing_cols + ["Soil organic carbon_CA_0_5", "geometry"]].copy()
+
+# ---------------------------------------------------------
+# 5) Export results
+# ---------------------------------------------------------
+# (a) Excel (attribute table without geometry)
+gdf.drop(columns="geometry").to_excel(output_excel, index=False)
+
+# (b) Shapefile (for QGIS visualization)
+gdf.to_file(output_shp, driver="ESRI Shapefile", encoding="utf-8")
+
+print(f"✅ Done!\n- Excel saved to: {output_excel}\n- Shapefile saved to: {output_shp}")
