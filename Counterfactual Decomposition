@@ -1,0 +1,75 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon May 19 20:45:44 2025
+
+@author: USUARIO
+"""
+
+import pandas as pd
+
+# --- Step 1: Load the Data ---
+file_path = r"C:.xlsx"
+df = pd.read_excel(file_path)
+
+# --- Step 2: Compute 2001 Baseline Proportions ---
+baseline_year = 2001
+baseline_df = df[df['Year'] == baseline_year]
+
+baseline_totals = (
+    baseline_df.groupby(['crop_name', 'Province'])['Surface_Irrigated']
+    .sum()
+    .reset_index(name='Total_Surface_Baseline')
+)
+
+baseline_df = baseline_df.merge(baseline_totals, on=['crop_name', 'Province'])
+baseline_df['Baseline_Proportion'] = baseline_df['Surface_Irrigated'] / baseline_df['Total_Surface_Baseline']
+
+baseline_prop_lookup = baseline_df.set_index(['crop_name', 'Province', 'Scenario'])['Baseline_Proportion'].to_dict()
+
+# --- Step 3: Compute Total Surface Irrigated per Year ---
+total_surface_per_year = (
+    df.groupby(['crop_name', 'Province', 'Year'])['Surface_Irrigated']
+    .sum()
+    .to_dict()
+)
+
+# --- Step 4: Apply Counterfactual Calculation ---
+def calculate_counterfactual(row):
+    key_baseline = (row['crop_name'], row['Province'], row['Scenario'])
+    key_total_area = (row['crop_name'], row['Province'], row['Year'])
+    
+    proportion = baseline_prop_lookup.get(key_baseline, 0)
+    total_area = total_surface_per_year.get(key_total_area, 0)
+    
+    counter_area = proportion * total_area
+    counter_bwf = counter_area * row['Average Blue Water per hectare (m3/ha)']
+    
+    return pd.Series([counter_area, counter_bwf])
+
+df[['Counterfactual_Surface_Irrigated', 'Counterfactual_BWF']] = df.apply(calculate_counterfactual, axis=1)
+
+# --- Step 5: Calculate Technology Mix Effect Safely ---
+# Avoid division by zero by masking zeros before division
+df['Technology_Mix_Effect (%)'] = pd.NA  # Default as NA
+
+valid_mask = df['Counterfactual_BWF'] != 0
+df.loc[valid_mask, 'Technology_Mix_Effect (%)'] = (
+    (df.loc[valid_mask, 'Blue Water Footprint (m3)'] - df.loc[valid_mask, 'Counterfactual_BWF']) / 
+    df.loc[valid_mask, 'Counterfactual_BWF']
+) * 100
+
+# --- Step 6: Final Output ---
+final_columns = [
+    'crop_name', 'Province', 'Year', 'Scenario',
+    'Surface_Irrigated', 'Counterfactual_Surface_Irrigated',
+    'Blue Water Footprint (m3)', 'Counterfactual_BWF',
+    'Technology_Mix_Effect (%)'
+]
+
+result_df = df[final_columns]
+
+# --- Step 7: Save the Results ---
+output_path = r"C:.xlsx"
+result_df.to_excel(output_path, index=False)
+
+
