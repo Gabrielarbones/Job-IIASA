@@ -1,0 +1,210 @@
+# -*- coding: utf-8 -*-
+"""
+Irrigated harvested area scaling and production estimation pipeline.
+Processes multiple crops, applies irrigation technology fractions,
+and computes scaled production using ACEA yield data.
+"""
+
+import gc
+import os
+import numpy as np
+import pandas as pd
+from netCDF4 import Dataset
+from osgeo import gdal
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def read_nc(file, var):
+    """Read a variable from a NetCDF4 file, squeezing all dimensions."""
+    with Dataset(file, "r", format="NETCDF4") as ds:
+        data = np.ma.squeeze(ds[f"/{var}"][:])
+    return np.ma.masked_where(data == 0, data)
+
+
+def save_nc(data, path, var_name, var_unit, title, start_year):
+    """Save a 3-D (year × lat × lon) array to a NetCDF4 file."""
+    n_years, n_lat, n_lon = data.shape
+    incrm = round(0.5 / 6, 6)
+    lats = np.arange(90 - incrm / 2, -n_lat / 24, -incrm)
+    lons = np.arange(-180 + incrm / 2, n_lon / 24, incrm)
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with Dataset(path, "w", format="NETCDF4") as ds:
+        ds.title       = title
+        ds.institution = "University of Twente, Netherlands"
+        ds.contact     = "Mialyk Oleksandr (o.mialyk@utwente.nl)"
+
+        ds.createDimension("lat",  n_lat)
+        ds.createDimension("lon",  n_lon)
+        ds.createDimension("time", n_years)
+
+        v_lat  = ds.createVariable("lat",    "f8", "lat")
+        v_lon  = ds.createVariable("lon",    "f8", "lon")
+        v_time = ds.createVariable("time",   "f8", "time")
+        v_val  = ds.createVariable(var_name, "f4", ("time", "lat", "lon"),
+                                   zlib=True, complevel=6, fill_value=1.e20)
+
+        v_lat[:],  v_lat.units,  v_lat.long_name  = lats, "degrees_north", "lat"
+        v_lon[:],  v_lon.units,  v_lon.long_name  = lons, "degrees_east",  "lon"
+        v_time[:], v_time.units, v_time.long_name = (
+            np.arange(start_year, start_year + n_years), "years", "time")
+        v_time.calendar = "standard"
+        v_val[:],  v_val.units  = data, var_unit
+
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+BASE_DIR   = r"C:\s"
+CROPS      = ["oat", "sgb", "rap", "pea", "apl", "avo", "veg", "vgl", "vgt", "bea", "ftn"]
+YEARS      = np.arange(2001, 2020)
+IRR_METHODS = ["Furrow"]
+SHAPE      = (len(YEARS), 2160, 4320)
+
+
+# ── Pipeline ──────────────────────────────────────────────────────────────────
+
+for crop in CROPS:
+    print(f"\n{'='*50}\nProcessing: {crop}\n{'='*50}")
+
+    # Paths
+    scaling_dir  = f"{BASE_DIR}/spain_{crop}_5arc_2024/scaling_data"
+    irr_dir      = ensure_dir(f"{BASE_DIR}/spain_{crop}_5arc_2024/processing_irrigated")
+    outputs_dir  = ensure_dir(f"{BASE_DIR}/spain_{crop}_5arc_2024/processing_outputs_irrigated")
+    acea_dir     = f"{BASE_DIR}/spain_{crop}_5arc_2024"
+
+    # ── Stage 1: Scale harvested area ─────────────────────────────────────────
+    ha_stats     = pd.read_excel(f"{scaling_dir}/Final_database_Ha_yields_crops.xlsx")
+    province_map = read_nc(f"{scaling_dir}/spain5_province_id.nc", "province_id")
+    ha_spam      = gdal.Open(f"{scaling_dir}/spam2010V2r0_global_H_{crop}_ir_5arc.tif").ReadAsArray()
+    ha_spam      = np.ma.masked_where(ha_spam <= 0, ha_spam)
+    provinces    = ha_stats.loc[ha_stats["NATCODE"] > 1, "NATCODE"].unique()
+
+    ha_raster = np.ma.masked_all(SHAPE)
+
+    for i, year in enumerate(YEARS):
+        print(f"  [Area] {year}")
+        cur = np.ma.masked_where(province_map.mask, ha_spam)
+
+        for pid in provinces:
+            mask = province_map == pid
+            stat = ha_stats.loc[(ha_stats["NATCODE"] == pid) &
+                                 (ha_stats["ACEA"]    == crop) &
+                                 (ha_stats["Year"]    == year)]
+            spam_sum = np.ma.sum(cur[mask])
+            if len(stat) and spam_sum > 0 and not np.ma.is_masked(spam_sum):
+                cur[mask] *= stat["Surface_Irrigated"].iloc[0] / spam_sum
+
+        # Global adjustment
+        expected = ha_stats.loc[(ha_stats["Year"] == year) &
+                                 (ha_stats["ACEA"] == crop), "Surface_Irrigated"].sum()
+        total = np.ma.sum(cur)
+        if total > 0:
+            cur *= expected / total
+
+        final = np.ma.sum(cur)
+        if not np.isclose(final, expected, atol=1):
+            print(f"    Warning: {final:.1f} ≠ {expected:.1f} (year {year})")
+
+        ha_raster[i] = cur
+
+    ha_raster = np.ma.masked_where(np.isnan(ha_raster), ha_raster)
+    save_nc(ha_raster, f"{irr_dir}/harv_area_scaled_{crop}_ir_annual_2001_2019.nc",
+            "harv_area", "ha yr-1", "Irrigated harvested areas per year", 2001)
+
+    pd.DataFrame({"crop_name": crop, "Year": YEARS,
+                  "Total Harvested Area (ha)": np.ma.sum(ha_raster, axis=(1, 2))}
+                 ).to_excel(f"{irr_dir}/total_harvested_area_{crop}_ir_2001_2019.xlsx", index=False)
+
+    # ── Stage 2: Apply irrigation technology fractions ────────────────────────
+    for method in IRR_METHODS:
+        print(f"  [Irr tech] {method}")
+        irr_tech = pd.read_excel(f"{scaling_dir}/Main_crops_IrrTechn_Percentage_{method}.xlsx")
+        method_raster = np.ma.zeros_like(ha_raster)
+
+        for i, year in enumerate(YEARS):
+            ref_year = max(year, 2004)
+            frac = irr_tech.loc[(irr_tech["ACEA"] == crop) &
+                                 (irr_tech["Year"] == ref_year), "Percentage"].iloc[0] / 100
+            method_raster[i] = ha_raster[i] * frac
+
+        save_nc(method_raster,
+                f"{irr_dir}/harv_area_scaled_{crop}_{method.lower()}_ir_annual_2001_2019.nc",
+                f"harv_area_{method.lower()}", "ha yr-1",
+                f"{method} irrigated harvested areas per year", 2001)
+
+        pd.DataFrame({"crop_name": crop, "Irrigation Method": method,
+                      "Year": YEARS,
+                      "Total Harvested Area (ha)": np.ma.sum(method_raster, axis=(1, 2))}
+                     ).to_excel(f"{irr_dir}/harvested_area_{crop}_{method.lower()}_ir_totals.xlsx",
+                                index=False)
+
+    # ── Stage 3: Compute scaling factors and production ───────────────────────
+    prod_stats = pd.read_excel(f"{scaling_dir}/Final_database_Ha_yields_crops.xlsx")
+    irr_tech   = pd.read_excel(f"{scaling_dir}/Main_crops_IrrTechn_Percentage.xlsx")
+    wsc3_yield = read_nc(
+        f"{acea_dir}/acea_5arc_wsc3_{crop}_crop_yield_global_annual_2000_2019.nc", "crop_yield")
+
+    sf_raster   = np.ma.masked_all(SHAPE)
+    prod_raster = np.ma.masked_all(SHAPE)
+
+    for i, year in enumerate(YEARS):
+        print(f"  [Prod] {year}")
+        ref_year = max(year, 2004)
+        tech_year = irr_tech.loc[(irr_tech["ACEA"] == crop) & (irr_tech["Year"] == ref_year)]
+        frac3 = tech_year.loc[tech_year["Technology"] == "Furrow", "Percentage"].iloc[0] / 100
+
+        for pid in provinces:
+            mask  = province_map == pid
+            pstat = prod_stats.loc[(prod_stats["NATCODE"] == pid) &
+                                   (prod_stats["ACEA"]    == crop) &
+                                   (prod_stats["Year"]    == year)]
+            if not len(pstat):
+                continue
+
+            prod_stat = (pstat["Surface_Irrigated"].iloc[0] *
+                         pstat["Yield_Irrigated"].iloc[0] / 1000)
+            acea_sum  = np.ma.sum(frac3 * ha_raster[i, mask] * wsc3_yield[i, mask])
+
+            if acea_sum > 0:
+                sf = prod_stat / acea_sum
+                sf_raster[i, mask]   = sf
+                prod_raster[i, mask] = wsc3_yield[i, mask] * sf * ha_raster[i, mask] * frac3
+
+    save_nc(sf_raster,
+            f"{outputs_dir}/scaling_factor_{crop}_ir_annual_2001_2019.nc",
+            "scaling_factor", "-", "Scaling factor for irrigated yields", 2001)
+    save_nc(prod_raster,
+            f"{outputs_dir}/prod_{crop}_wsc3_annual_2001_2019.nc",
+            "prod", "t yr-1", "Actual crop production WSC3", 2001)
+
+    # Annual production summary
+    pd.DataFrame({"crop_name": crop, "Year": YEARS,
+                  "Total Production WSC3 (t yr-1)": np.ma.sum(prod_raster, axis=(1, 2))}
+                 ).to_excel(f"{outputs_dir}/total_production_by_year_scenarios_{crop}.xlsx",
+                            index=False)
+
+    # Scaling factors per province
+    rows = [{"Year": year, "Province ID": pid, "crop_name": crop,
+              "Scaling Factor": np.ma.mean(sf_raster[i, province_map == pid])}
+            for i, year in enumerate(YEARS) for pid in provinces]
+    pd.DataFrame(rows).to_excel(
+        f"{outputs_dir}/scaling_factors_per_province_{crop}.xlsx", index=False)
+
+    # Global (spatial mean) scaling factors per year
+    rows = [{"Year": year, "crop_name": crop,
+              "Global Scaling Factor": np.ma.mean(sf_raster[i])}
+            for i, year in enumerate(YEARS)]
+    pd.DataFrame(rows).to_excel(
+        f"{outputs_dir}/global_scaling_factors_{crop}_ir_annual_2001_2019.xlsx", index=False)
+
+    print(f"  Done: {crop}")
+
+# ── Clean up ──────────────────────────────────────────────────────────────────
+gc.collect()
+print("\nAll crops processed.")
