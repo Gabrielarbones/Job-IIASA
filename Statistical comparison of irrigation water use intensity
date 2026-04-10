@@ -1,0 +1,166 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Mar 31 12:30:43 2026
+
+@author: USUARIO
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Mar  2 16:28:26 2026
+
+@author: USUARIO
+
+Export data used for boxplot (no plotting)
+Irrigation per hectare (m3/ha)
+California vs Spain
+Years: 2012–2021
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
+from statsmodels.stats.multicomp import MultiComparison
+
+# =========================
+# CONFIGURATION
+# =========================
+
+INPUT_PATH = Path(
+    r"C:\Users\USUARIO\ownCloud - GABRIEL ARBONES DOMINGO@drive.upm.es\UPM\Analisis Doctorado\3er artículo\Article\Results_environtmental\Water_indicator_2.xlsx"
+)
+
+OUTPUT_EXCEL = INPUT_PATH.parent / "Boxplot_Irrigation_m3_ha_data_2012_2021.xlsx"
+
+ALPHA = 0.05
+INDICATOR_KEYWORD = "Irrigation"
+
+# =========================
+# LOAD DATA
+# =========================
+
+df = pd.read_excel(INPUT_PATH)
+df.columns = [str(c).strip().replace("\n", " ") for c in df.columns]
+df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
+
+def force_numeric(x):
+    if pd.isna(x):
+        return np.nan
+    x = str(x).strip().replace(" ", "")
+    if "," in x and "." not in x:
+        x = x.replace(",", ".")
+    else:
+        x = x.replace(",", "")
+    x = "".join(ch for ch in x if ch.isdigit() or ch in ".-+eE")
+    try:
+        return float(x)
+    except:
+        return np.nan
+
+df["Value"] = df["Value"].map(force_numeric)
+
+# =========================
+# FILTER DATA
+# =========================
+
+df = df[
+    (df["Year"] >= 2012) &
+    (df["Year"] <= 2021) &
+    (df["Indicator"].str.contains(INDICATOR_KEYWORD, case=False, na=False)) &
+    (df["Country"].isin(["California", "Spain"]))
+].copy()
+
+df = df.dropna(subset=["Value"])
+
+# Ensure correct order
+order = ["California", "Spain"]
+df["Country"] = pd.Categorical(df["Country"], categories=order, ordered=True)
+
+# =========================
+# SUMMARY STATISTICS
+# =========================
+
+summary = df.groupby("Country")["Value"].describe()
+
+# =========================
+# ANOVA + TUKEY
+# =========================
+
+model = ols("Value ~ C(Country)", data=df).fit()
+anova = sm.stats.anova_lm(model, typ=2)
+
+mc = MultiComparison(df["Value"], df["Country"])
+tukey_result = mc.tukeyhsd(alpha=ALPHA)
+
+# =========================
+# GENERATE CLD LETTERS
+# =========================
+
+def tukey_cld(tukey_result, df):
+    groups = list(tukey_result.groupsunique)
+    letters = {g: "" for g in groups}
+    current_letter = "a"
+
+    reject_dict = {g: set() for g in groups}
+    for i in range(len(tukey_result.reject)):
+        if tukey_result.reject[i]:
+            g1 = tukey_result._results_table.data[i+1][0]
+            g2 = tukey_result._results_table.data[i+1][1]
+            reject_dict[g1].add(g2)
+            reject_dict[g2].add(g1)
+
+    means = df.groupby("Country")["Value"].mean().sort_values(ascending=False)
+
+    for g in means.index:
+        assigned = False
+        for letter in set(letters.values()):
+            if letter == "":
+                continue
+            conflict = any(other in reject_dict[g] for other, ltr in letters.items() if ltr == letter)
+            if not conflict:
+                letters[g] += letter
+                assigned = True
+                break
+        if not assigned:
+            letters[g] += current_letter
+            current_letter = chr(ord(current_letter) + 1)
+
+    return letters
+
+letters = tukey_cld(tukey_result, df)
+letters_df = pd.DataFrame(list(letters.items()), columns=["Country", "Tukey_Letter"])
+
+# =========================
+# WHISKER CALCULATION
+# =========================
+
+whiskers = []
+
+for g in order:
+    group_data = df[df["Country"] == g]["Value"]
+    q1 = group_data.quantile(0.25)
+    q3 = group_data.quantile(0.75)
+    iqr = q3 - q1
+    lower = max(group_data.min(), q1 - 1.5 * iqr)
+    upper = min(group_data.max(), q3 + 1.5 * iqr)
+    whiskers.append([g, q1, q3, iqr, lower, upper])
+
+whiskers_df = pd.DataFrame(
+    whiskers,
+    columns=["Country", "Q1", "Q3", "IQR", "Lower_Whisker", "Upper_Whisker"]
+)
+
+# =========================
+# EXPORT TO EXCEL
+# =========================
+
+with pd.ExcelWriter(OUTPUT_EXCEL, engine="openpyxl") as writer:
+    df.to_excel(writer, sheet_name="Raw_Data", index=False)
+    summary.to_excel(writer, sheet_name="Summary_Stats")
+    letters_df.to_excel(writer, sheet_name="Tukey_Letters", index=False)
+    whiskers_df.to_excel(writer, sheet_name="Whiskers", index=False)
+
+print("\n✅ Excel file created:")
+print(OUTPUT_EXCEL)
